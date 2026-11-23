@@ -1,73 +1,136 @@
+"""다중 사용자 Tkinter 채팅용 TCP 서버 (Python 표준 라이브러리만 사용)."""
+import argparse
+import json
+import os
 import socket
 import threading
+from dataclasses import dataclass, field
 
-# 서버 설정 (클라우드 환경에 맞게 모든 IP 접속 허용으로 변경)
-HOST = '0.0.0.0'
-PORT = 9999
+MAX_PACKET = 16384
 
-# 접속한 클라이언트 소켓들을 저장할 리스트
-clients = []
+@dataclass(eq=False)
+class Peer:
+    sock: socket.socket
+    name: str = ""
+    send_lock: threading.Lock = field(default_factory=threading.Lock)
 
-# 모든 클라이언트에게 메시지를 전송하는 함수 (브로드캐스트)
-def broadcast(message, sender_socket):
-    for client in clients:
-        # 메시지를 보낸 본인을 제외하고 나머지 사람들에게만 전송
-        if client != sender_socket:
+    def send(self, message: dict) -> None:
+        raw = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
+        with self.send_lock:
+            self.sock.sendall(raw)
+
+
+class ChatServer:
+    def __init__(self, host: str, port: int):
+        self.host, self.port = host, port
+        self.peers: set[Peer] = set()
+        self.lock = threading.RLock()
+
+    def broadcast(self, packet: dict, exclude: Peer | None = None) -> None:
+        with self.lock:
+            targets = [p for p in self.peers if p is not exclude]
+        for peer in targets:
             try:
-                client.sendall(message)
-            except:
-                # 연결이 끊어진 소켓은 리스트에서 제거
-                if client in clients:
-                    clients.remove(client)
+                peer.send(packet)
+            except OSError:
+                self.remove(peer)
 
-# 개별 클라이언트의 메시지를 지속적으로 수신하는 함수 (스레드로 작동)
-def handle_client(client_socket, addr):
-    print(f"[+] 새 연결: {addr}")
-    clients.append(client_socket)
-    
-    try:
-        while True:
-            # 클라이언트로부터 메시지 수신
-            data = client_socket.recv(1024)
-            if not data:
-                break
-                
-            # 받은 메시지를 다른 모든 사람에게 공유
-            print(f"[{addr}] {data.decode('utf-8')}")
-            broadcast(data, client_socket)
-            
-    except ConnectionResetError:
-        # 클라이언트가 강제 종료했을 때 처리
-        pass
-    finally:
-        # 연결 종료 시 청소
-        if client_socket in clients:
-            clients.remove(client_socket)
-        client_socket.close()
-        print(f"[-] 연결 종료: {addr}")
+    def user_list(self) -> None:
+        with self.lock:
+            names = sorted(p.name for p in self.peers if p.name)
+        self.broadcast({"type": "users", "names": names})
 
-# 메인 서버 실행 루프
-def start_server():
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind((HOST, PORT))
-    server_socket.listen()
-    print(f"[*] 메신저 서버가 {PORT}번 포트에서 시작되었습니다...")
+    def remove(self, peer: Peer) -> None:
+        with self.lock:
+            if peer not in self.peers:
+                return
+            self.peers.remove(peer)
+        try:
+            peer.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        peer.sock.close()
+        if peer.name:
+            print(f"퇴장: {peer.name}")
+            self.broadcast({"type": "typing", "name": peer.name, "active": False})
+            self.broadcast({"type": "notice", "text": f"{peer.name}님이 퇴장했습니다."})
+            self.user_list()
 
-    try:
-        while True:
-            # 새로운 클라이언트 접속 접수
-            client_socket, addr = server_socket.accept()
-            
-            # 각 클라이언트 전용 개별 스레드 생성 및 실행 (동시 처리 핵심)
-            client_thread = threading.Thread(target=handle_client, args=(client_socket, addr))
-            client_thread.daemon = True # 서버 종료 시 스레드도 같이 종료되도록 설정
-            client_thread.start()
-            
-    except KeyboardInterrupt:
-        print("\n[*] 서버를 종료합니다.")
-    finally:
-        server_socket.close()
+    def handle(self, sock: socket.socket, addr) -> None:
+        peer = Peer(sock)
+        try:
+            with sock.makefile("r", encoding="utf-8", newline="\n") as stream:
+                first = stream.readline(MAX_PACKET + 1)
+                if not first or len(first) > MAX_PACKET:
+                    return
+                hello = json.loads(first)
+                if hello.get("type") != "join":
+                    peer.send({"type": "error", "text": "입장 메시지가 필요합니다."})
+                    return
+                name = str(hello.get("name", "")).strip()[:20]
+                if not name or any(ord(ch) < 32 for ch in name):
+                    peer.send({"type": "error", "text": "올바른 닉네임을 입력하세요."})
+                    return
+                with self.lock:
+                    if any(p.name == name for p in self.peers):
+                        peer.send({"type": "error", "text": "이미 사용 중인 닉네임입니다."})
+                        return
+                    peer.name = name
+                    self.peers.add(peer)
+                peer.send({"type": "welcome", "name": name})
+                print(f"입장: {name} ({addr[0]})")
+                self.broadcast({"type": "notice", "text": f"{name}님이 입장했습니다."})
+                self.user_list()
+                while True:
+                    line = stream.readline(MAX_PACKET + 1)
+                    if not line or len(line) > MAX_PACKET:
+                        break
+                    try:
+                        msg = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    typ = msg.get("type")
+                    if typ == "chat":
+                        body = str(msg.get("text", "")).strip()[:2000]
+                        if body:
+                            self.broadcast({"type": "chat", "name": name, "text": body})
+                            self.broadcast({"type": "typing", "name": name, "active": False})
+                    elif typ == "typing":
+                        self.broadcast({"type": "typing", "name": name,
+                                        "active": msg.get("active") is True}, exclude=peer)
+                    elif typ == "leave":
+                        break
+        except (OSError, UnicodeError, ValueError) as exc:
+            print(f"접속 종료 ({addr}): {exc}")
+        finally:
+            self.remove(peer)
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def run(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((self.host, self.port))
+            server.listen()
+            print(f"서버 실행 중: {self.host}:{self.port} (Ctrl+C로 종료)")
+            try:
+                while True:
+                    client, addr = server.accept()
+                    threading.Thread(target=self.handle, args=(client, addr), daemon=True).start()
+            except KeyboardInterrupt:
+                print("\n서버 종료")
+            finally:
+                with self.lock:
+                    peers = list(self.peers)
+                for peer in peers:
+                    self.remove(peer)
+
 
 if __name__ == "__main__":
-    start_server()
+    parser = argparse.ArgumentParser(description="다중 사용자 채팅 서버")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=int(os.getenv("RAILWAY_TCP_APPLICATION_PORT") or os.getenv("PORT") or "12550"))
+    args = parser.parse_args()
+    ChatServer(args.host, args.port).run()
