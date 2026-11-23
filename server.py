@@ -1,10 +1,12 @@
-"""다중 사용자 Tkinter 채팅용 TCP 서버 (Python 표준 라이브러리만 사용)."""
+"""Railway TCP group chat: threaded JSON-lines, SQLite chat history."""
 import argparse
 import json
 import os
 import socket
+import sqlite3
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 MAX_PACKET = 16384
 
@@ -14,94 +16,114 @@ class Peer:
     name: str = ""
     send_lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def send(self, message: dict) -> None:
-        raw = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
+    def send(self, packet):
         with self.send_lock:
-            self.sock.sendall(raw)
+            self.sock.sendall((json.dumps(packet, ensure_ascii=False) + "\n").encode("utf-8"))
 
 
 class ChatServer:
-    def __init__(self, host: str, port: int):
+    def __init__(self, host, port, db_path):
         self.host, self.port = host, port
-        self.peers: set[Peer] = set()
         self.lock = threading.RLock()
+        self.peers = set()
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        self.db = sqlite3.connect(db_path, check_same_thread=False)
+        self.db.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL)")
+        self.db.commit()
+        print("DB:", db_path, flush=True)
 
-    def broadcast(self, packet: dict, exclude: Peer | None = None) -> None:
+    def broadcast(self, packet, exclude=None):
+        # Caller may hold self.lock, ensuring that history and live messages don't cross.
         with self.lock:
-            targets = [p for p in self.peers if p is not exclude]
-        for peer in targets:
-            try:
-                peer.send(packet)
-            except OSError:
-                self.remove(peer)
+            for peer in list(self.peers):
+                if peer is exclude:
+                    continue
+                try:
+                    peer.send(packet)
+                except OSError:
+                    self.remove(peer)
 
-    def user_list(self) -> None:
+    def user_list(self):
         with self.lock:
-            names = sorted(p.name for p in self.peers if p.name)
-        self.broadcast({"type": "users", "names": names})
+            self.broadcast({"type": "users", "names": sorted(p.name for p in self.peers if p.name)})
 
-    def remove(self, peer: Peer) -> None:
+    def remove(self, peer):
         with self.lock:
             if peer not in self.peers:
                 return
             self.peers.remove(peer)
-        try:
-            peer.sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        peer.sock.close()
-        if peer.name:
-            print(f"퇴장: {peer.name}")
-            self.broadcast({"type": "typing", "name": peer.name, "active": False})
-            self.broadcast({"type": "notice", "text": f"{peer.name}님이 퇴장했습니다."})
-            self.user_list()
+            try:
+                peer.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            peer.sock.close()
+            if peer.name:
+                self.broadcast({"type": "typing", "name": peer.name, "active": False})
+                self.broadcast({"type": "notice", "text": f"{peer.name}님이 퇴장했습니다."})
+                self.user_list()
 
-    def handle(self, sock: socket.socket, addr) -> None:
+    def handle(self, sock, addr):
         peer = Peer(sock)
         try:
             with sock.makefile("r", encoding="utf-8", newline="\n") as stream:
-                first = stream.readline(MAX_PACKET + 1)
-                if not first or len(first) > MAX_PACKET:
+                line = stream.readline(MAX_PACKET + 1)
+                if not line or len(line) > MAX_PACKET:
                     return
-                hello = json.loads(first)
-                if hello.get("type") != "join":
+                hello = json.loads(line)
+                if not isinstance(hello, dict) or hello.get("type") != "join":
                     peer.send({"type": "error", "text": "입장 메시지가 필요합니다."})
                     return
                 name = str(hello.get("name", "")).strip()[:20]
                 if not name or any(ord(ch) < 32 for ch in name):
-                    peer.send({"type": "error", "text": "올바른 닉네임을 입력하세요."})
+                    peer.send({"type": "error", "text": "올바른 닉네임이 필요합니다."})
                     return
                 with self.lock:
                     if any(p.name == name for p in self.peers):
-                        peer.send({"type": "error", "text": "이미 사용 중인 닉네임입니다."})
+                        peer.send({"type": "error", "text": "현재 접속 중인 닉네임입니다."})
                         return
                     peer.name = name
+                    peer.send({"type": "welcome", "name": name})
+                    peer.send({"type": "history_start"})
+                    # History is sent before joining the broadcast set, under the
+                    # same lock as writes so there is no gap or duplicate.
+                    cursor = self.db.execute("SELECT id,name,body,created_at FROM messages ORDER BY id")
+                    for mid, sender, body, created in cursor:
+                        peer.send({"type": "chat", "id": mid, "name": sender, "text": body, "time": created, "history": True})
+                    peer.send({"type": "history_end"})
                     self.peers.add(peer)
-                peer.send({"type": "welcome", "name": name})
-                print(f"입장: {name} ({addr[0]})")
-                self.broadcast({"type": "notice", "text": f"{name}님이 입장했습니다."})
-                self.user_list()
+                    self.broadcast({"type": "notice", "text": f"{name}님이 입장했습니다."})
+                    self.user_list()
+                print("JOIN", name, addr[0], flush=True)
                 while True:
                     line = stream.readline(MAX_PACKET + 1)
                     if not line or len(line) > MAX_PACKET:
                         break
                     try:
                         msg = json.loads(line)
-                    except (ValueError, TypeError):
+                    except ValueError:
                         continue
-                    typ = msg.get("type")
-                    if typ == "chat":
-                        body = str(msg.get("text", "")).strip()[:2000]
+                    if not isinstance(msg, dict):
+                        continue
+                    kind = msg.get("type")
+                    if kind == "chat":
+                        body = msg.get("text", "")
+                        if not isinstance(body, str):
+                            continue
+                        body = body.strip()[:2000]
                         if body:
-                            self.broadcast({"type": "chat", "name": name, "text": body})
-                            self.broadcast({"type": "typing", "name": name, "active": False})
-                    elif typ == "typing":
-                        self.broadcast({"type": "typing", "name": name,
-                                        "active": msg.get("active") is True}, exclude=peer)
-                    elif typ == "leave":
+                            stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                            with self.lock:
+                                cursor = self.db.execute("INSERT INTO messages(name,body,created_at) VALUES (?,?,?)", (name, body, stamp))
+                                self.db.commit()
+                                packet = {"type": "chat", "id": cursor.lastrowid, "name": name, "text": body, "time": stamp}
+                                self.broadcast(packet)
+                                self.broadcast({"type": "typing", "name": name, "active": False})
+                    elif kind == "typing":
+                        self.broadcast({"type": "typing", "name": name, "active": msg.get("active") is True}, exclude=peer)
+                    elif kind == "leave":
                         break
-        except (OSError, UnicodeError, ValueError) as exc:
-            print(f"접속 종료 ({addr}): {exc}")
+        except (OSError, UnicodeError, ValueError, sqlite3.Error) as exc:
+            print("CLIENT ERROR", addr, exc, flush=True)
         finally:
             self.remove(peer)
             try:
@@ -109,28 +131,23 @@ class ChatServer:
             except OSError:
                 pass
 
-    def run(self) -> None:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind((self.host, self.port))
-            server.listen()
-            print(f"서버 실행 중: {self.host}:{self.port} (Ctrl+C로 종료)")
-            try:
-                while True:
-                    client, addr = server.accept()
-                    threading.Thread(target=self.handle, args=(client, addr), daemon=True).start()
-            except KeyboardInterrupt:
-                print("\n서버 종료")
-            finally:
-                with self.lock:
-                    peers = list(self.peers)
-                for peer in peers:
-                    self.remove(peer)
-
+    def run(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((self.host, self.port))
+            srv.listen()
+            print(f"Listening on {self.host}:{self.port}", flush=True)
+            while True:
+                try:
+                    sock, addr = srv.accept()
+                except KeyboardInterrupt:
+                    break
+                threading.Thread(target=self.handle, args=(sock, addr), daemon=True).start()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="다중 사용자 채팅 서버")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=int(os.getenv("RAILWAY_TCP_APPLICATION_PORT") or os.getenv("PORT") or "12550"))
+    parser.add_argument("--db", default=os.getenv("DB_PATH") or os.path.join(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/app/data"), "chat.sqlite3"))
     args = parser.parse_args()
-    ChatServer(args.host, args.port).run()
+    ChatServer(args.host, args.port, args.db).run()
